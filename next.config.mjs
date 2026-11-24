@@ -1,4 +1,4 @@
-import { withSentryConfig } from "@sentry/nextjs";
+import { withSentryConfig } from "@sentry/nextjs/config";
 import ContentSecurityPolicy from "./csp.config.mjs";
 
 const pkg = await import("./package.json", { with: { type: "json" } });

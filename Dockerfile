@@ -1,4 +1,4 @@
-FROM node:22-slim AS runtime-dev
+FROM node:26.13.1-slim AS runtime-dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
@@ -8,7 +8,7 @@ WORKDIR /app
 
 CMD ["npm", "run", "dev"]
 
-FROM node:22-slim AS runtime-prod
+FROM node:26.13.1-slim AS runtime-prod
 
 WORKDIR /app
 
