@@ -5,7 +5,31 @@ interface SearchResult {
   url: string;
   raw_url: string;
   excerpt: string;
+  content: string;
   meta: { title?: string; parent_title?: string };
+}
+
+const MAX_RESULTS = 8;
+const MAX_CANDIDATES = 50;
+const BATCH_SIZE = 10;
+
+// Lowercase, strip accents and split on anything that isn't a letter or digit.
+export function tokenize(text: string): string[] {
+  return text
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+// Pagefind matches terms by prefix ("passe" also finds "passeport"), so keep
+// only pages that contain every word of the query as a whole word.
+export function containsAllWords(result: SearchResult, words: string[]): boolean {
+  const pageWords = new Set(
+    tokenize(`${result.meta.parent_title ?? ""} ${result.meta.title ?? ""} ${result.content}`),
+  );
+  return words.every((w) => pageWords.has(w));
 }
 
 interface Pagefind {
@@ -85,7 +109,14 @@ export function useSearch() {
     setLoading(true);
     try {
       const search = await pf.search(q);
-      const data = await Promise.all(search.results.slice(0, 8).map((r) => r.data()));
+      const words = tokenize(q);
+      const candidates = search.results.slice(0, MAX_CANDIDATES);
+      const data: SearchResult[] = [];
+      for (let i = 0; i < candidates.length && data.length < MAX_RESULTS; i += BATCH_SIZE) {
+        const batch = await Promise.all(candidates.slice(i, i + BATCH_SIZE).map((r) => r.data()));
+        data.push(...batch.filter((r) => containsAllWords(r, words)));
+      }
+      data.splice(MAX_RESULTS);
       if (lastSearchedRef.current !== q) {
         setActiveIndex(0);
         lastSearchedRef.current = q;
