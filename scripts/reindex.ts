@@ -25,6 +25,7 @@ import {
   rewriteAllInterlinks,
 } from "../src/lib/collection-tree";
 import { buildSectionTree } from "../src/lib/docs2dsfr/server";
+import { recordPaths } from "../src/lib/path-history";
 import { closeRedis } from "../src/lib/redis";
 import { allSites, type Site } from "../src/lib/sites";
 
@@ -78,6 +79,8 @@ async function gatherPages(site: Site): Promise<{ pages: PageToIndex[]; failures
       // forceRefresh=true: deploy-time index should reflect the latest CMS state.
       const rawSections = await buildSectionTree(collection.docsId, true, false, onError);
       const sections = rawSections.map((s) => buildPageItem(s));
+      // Keep old URLs redirecting after a page rename (see path-history.ts).
+      await recordPaths(site.host, collection.slug, sections);
       // CMS interlinks `/docs/UUID/` → helpcenter URLs (unresolved UUIDs get
       // their hrefs stripped so pagefind doesn't surface dead-link text).
       rewriteAllInterlinks(sections, (uuid) => {

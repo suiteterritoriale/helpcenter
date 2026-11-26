@@ -10,6 +10,7 @@ import {
   rewriteAllInterlinks,
   subtreeContains,
 } from "@/lib/collection-tree";
+import { lookupPageIdByPath, recordPaths } from "@/lib/path-history";
 import { getCollectionBySlug, getSiteForHost, NavCollection } from "@/lib/sites";
 import { GetServerSideProps } from "next";
 import { NextSeo } from "next-seo";
@@ -101,9 +102,23 @@ export const getServerSideProps: GetServerSideProps<CollectionPageProps> = async
     const requestedPath = pagePath?.join("/") || "";
     let currentPage: PageItem | null = null;
 
+    // Remember every current path so links survive a later page rename.
+    // Fire-and-forget: a Redis hiccup must not slow down or break the render.
+    void recordPaths(site.host, collection.slug, sections);
+
     if (requestedPath) {
       currentPage = findPageByPath(sections, requestedPath);
       if (!currentPage) {
+        // Old URL of a page renamed (or moved) in the CMS → redirect to its
+        // current URL. Not permanent: the old path may later be reused by
+        // another page, and browsers cache permanent redirects forever.
+        const previousId = await lookupPageIdByPath(site.host, collection.slug, requestedPath);
+        const renamed = previousId ? findPageById(sections, previousId) : null;
+        if (renamed) {
+          return {
+            redirect: { destination: `/${collection.slug}/${renamed.path}`, permanent: false },
+          };
+        }
         return { notFound: true };
       }
     } else {
