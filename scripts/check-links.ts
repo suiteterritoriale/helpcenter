@@ -1,10 +1,17 @@
 /**
- * Checks every internal doc-to-doc interlink (`<a href="/docs/UUID/">`) across
- * all configured sites/collections and reports any UUID that doesn't resolve
- * to a page in the same collection's tree — the exact resolution SSR does
- * (see rewriteAllInterlinks in src/pages/[collection]/[[...page]].tsx), so a
- * link reported here is one that would actually render stripped/broken in
- * production.
+ * Checks the links written in CMS content across all configured
+ * sites/collections and reports the ones that are broken:
+ *
+ * - CMS interlinks (`<a href="/docs/UUID/">`) whose UUID doesn't resolve to a
+ *   page in the same collection's tree — the exact resolution SSR does (see
+ *   rewriteAllInterlinks in src/pages/[collection]/[[...page]].tsx), so such a
+ *   link would render stripped in production.
+ * - Links to helpcenter URLs (`https://<configured host>/<collection>/<path>`
+ *   or `/<collection>/<path>`) that no longer match a page. These URLs are
+ *   derived from page titles, so they break when the target page is renamed
+ *   or moved. When the path history (see src/lib/path-history.ts) knows the
+ *   page, its current URL is suggested. Such links are better replaced by a
+ *   CMS interlink, which survives renames.
  *
  * Usage: npm run check-links
  */
@@ -13,9 +20,11 @@ if (!process.env.DOCS_CMS_URL) {
   throw new Error("DOCS_CMS_URL environment variable is required");
 }
 
-import { buildPageItem, findPageById, PageItem } from "../src/lib/collection-tree";
+import { buildPageItem, findPageById, findPageByPath, PageItem } from "../src/lib/collection-tree";
 import { DocsChild } from "../src/lib/docs2dsfr/client";
 import { getDocumentChildren } from "../src/lib/docs2dsfr/server";
+import { extractLinks, parseHelpcenterLink } from "../src/lib/helpcenter-links";
+import { lookupPageIdByPath } from "../src/lib/path-history";
 import { closeRedis } from "../src/lib/redis";
 import { allSites, type Site } from "../src/lib/sites";
 
@@ -56,13 +65,24 @@ async function buildTreeSequentially(
 }
 
 interface BrokenLink {
+  kind: "interlink" | "url";
   site: string;
   collection: string;
   sourceTitle: string;
   sourceUrl: string;
-  targetUuid: string;
+  // Missing doc UUID (interlink) or dead helpcenter URL (url).
+  target: string;
   linkText: string;
+  // Current URL of the target page, when it could be recovered.
+  suggestion?: string;
 }
+
+// Trees of every collection, keyed by `${host}/${collectionSlug}`. A value of
+// null means the collection exists but its tree couldn't be fetched, so links
+// into it can't be verified.
+type Trees = Map<string, PageItem[] | null>;
+
+const treeKey = (host: string, collectionSlug: string) => `${host}/${collectionSlug}`;
 
 const INTERLINK_RE = /<a\b[^>]*?\bhref="\/docs\/([0-9a-f-]+)\/?"[^>]*?>([\s\S]*?)<\/a>/gi;
 
@@ -70,34 +90,53 @@ function stripTags(html: string): string {
   return html.replace(/<[^>]+>/g, "").trim();
 }
 
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
+const urlOf = (collectionSlug: string, path: string) =>
+  `${BASE_PATH}/${collectionSlug}${path ? `/${path}` : ""}`;
+
 function findBrokenInterlinks(
+  html: string,
   sections: PageItem[],
-  collectionSlug: string,
-  siteHost: string,
+  base: Omit<BrokenLink, "kind" | "target" | "linkText">,
 ): BrokenLink[] {
   const broken: BrokenLink[] = [];
-  const visit = (item: PageItem) => {
-    const html = item.document?.content;
-    if (html) {
-      let match: RegExpExecArray | null;
-      INTERLINK_RE.lastIndex = 0;
-      while ((match = INTERLINK_RE.exec(html))) {
-        const uuid = match[1];
-        if (!findPageById(sections, uuid)) {
-          broken.push({
-            site: siteHost,
-            collection: collectionSlug,
-            sourceTitle: item.title,
-            sourceUrl: `/${collectionSlug}/${item.path}`,
-            targetUuid: uuid,
-            linkText: stripTags(match[2]),
-          });
-        }
-      }
+  for (const match of html.matchAll(INTERLINK_RE)) {
+    if (!findPageById(sections, match[1])) {
+      broken.push({ ...base, kind: "interlink", target: match[1], linkText: stripTags(match[2]) });
     }
-    for (const child of item.children) visit(child);
-  };
-  for (const section of sections) visit(section);
+  }
+  return broken;
+}
+
+async function findBrokenUrls(
+  html: string,
+  trees: Trees,
+  base: Omit<BrokenLink, "kind" | "target" | "linkText">,
+): Promise<BrokenLink[]> {
+  const broken: BrokenLink[] = [];
+  for (const { href, text } of extractLinks(html)) {
+    const target = parseHelpcenterLink(href, base.site, allSites.keys(), BASE_PATH);
+    if (!target || !target.collection) continue;
+
+    const key = treeKey(target.host, target.collection);
+    if (!trees.has(key)) {
+      // Unknown collection slug: the whole URL 404s.
+      broken.push({ ...base, kind: "url", target: href, linkText: text });
+      continue;
+    }
+    const sections = trees.get(key);
+    if (!sections) continue; // tree unavailable — can't tell, don't report
+    if (!target.path || findPageByPath(sections, target.path)) continue;
+
+    let suggestion: string | undefined;
+    const previousId = await lookupPageIdByPath(target.host, target.collection, target.path);
+    const current = previousId ? findPageById(sections, previousId) : null;
+    if (current) {
+      const sameHost = target.host === base.site;
+      suggestion = `${sameHost ? "" : `https://${target.host}`}${urlOf(target.collection, current.path)}`;
+    }
+    broken.push({ ...base, kind: "url", target: href, linkText: text, suggestion });
+  }
   return broken;
 }
 
@@ -109,26 +148,59 @@ function findBrokenInterlinks(
 // Set CHECK_LINKS_FRESH=1 to force a full live crawl bypassing the cache.
 const FORCE_REFRESH = process.env.CHECK_LINKS_FRESH === "1";
 
-async function checkSite(site: Site): Promise<BrokenLink[]> {
-  const broken: BrokenLink[] = [];
+async function fetchTrees(site: Site, trees: Trees): Promise<void> {
   for (const collection of site.collections) {
-    console.log(`  Checking collection: ${collection.title} (${collection.slug})`);
+    console.log(`  Fetching collection: ${collection.title} (${collection.slug})`);
     try {
       const rawSections = await buildTreeSequentially(collection.docsId, FORCE_REFRESH, false);
-      const sections = rawSections.map((s) => buildPageItem(s));
-      broken.push(...findBrokenInterlinks(sections, collection.slug, site.host));
+      trees.set(
+        treeKey(site.host, collection.slug),
+        rawSections.map((s) => buildPageItem(s)),
+      );
     } catch (e) {
+      trees.set(treeKey(site.host, collection.slug), null);
       console.error(
-        `Failed to check collection ${collection.slug} (${collection.docsId}):`,
+        `Failed to fetch collection ${collection.slug} (${collection.docsId}):`,
         e instanceof Error ? e.message : e,
       );
     }
   }
+}
+
+async function checkSite(site: Site, trees: Trees): Promise<BrokenLink[]> {
+  const broken: BrokenLink[] = [];
+  for (const collection of site.collections) {
+    const sections = trees.get(treeKey(site.host, collection.slug));
+    if (!sections) continue;
+    const visit = async (item: PageItem) => {
+      const html = item.document?.content;
+      if (html) {
+        const base = {
+          site: site.host,
+          collection: collection.slug,
+          sourceTitle: item.title,
+          sourceUrl: urlOf(collection.slug, item.path),
+        };
+        broken.push(...findBrokenInterlinks(html, sections, base));
+        broken.push(...(await findBrokenUrls(html, trees, base)));
+      }
+      for (const child of item.children) await visit(child);
+    };
+    for (const section of sections) await visit(section);
+  }
   return broken;
 }
 
+function formatLink(link: BrokenLink): string {
+  const source = `[${link.site}/${link.collection}] "${link.sourceTitle}" (${link.sourceUrl})`;
+  const label = link.linkText ? ` — link text: "${link.linkText}"` : "";
+  if (link.kind === "interlink") return `${source} → missing doc ${link.target}${label}`;
+  const fix = link.suggestion ? `\n    page now at: ${link.suggestion}` : "";
+  return `${source} → dead URL ${link.target}${label}${fix}`;
+}
+
 async function run() {
-  console.log("Checking internal doc links...");
+  console.log("Checking internal links...");
   console.log(`CMS URL: ${process.env.DOCS_CMS_URL}`);
   console.log(`Sites configured: ${allSites.size}`);
 
@@ -138,9 +210,15 @@ async function run() {
 
   const allBroken: BrokenLink[] = [];
   try {
+    // Fetch every tree first: a link can point to another collection or site.
+    const trees: Trees = new Map();
+    for (const site of allSites.values()) {
+      console.log(`\n=== Fetching site: ${site.host} ===`);
+      await fetchTrees(site, trees);
+    }
     for (const site of allSites.values()) {
       console.log(`\n=== Checking site: ${site.host} ===`);
-      allBroken.push(...(await checkSite(site)));
+      allBroken.push(...(await checkSite(site, trees)));
     }
   } finally {
     await closeRedis();
@@ -151,13 +229,18 @@ async function run() {
     return;
   }
 
-  console.log(`\nFound ${allBroken.length} broken internal link(s):\n`);
-  for (const link of allBroken) {
-    const label = link.linkText ? ` — link text: "${link.linkText}"` : "";
+  const interlinks = allBroken.filter((l) => l.kind === "interlink");
+  const urls = allBroken.filter((l) => l.kind === "url");
+  if (interlinks.length > 0) {
+    console.log(`\nFound ${interlinks.length} broken doc interlink(s):\n`);
+    for (const link of interlinks) console.log(formatLink(link));
+  }
+  if (urls.length > 0) {
     console.log(
-      `[${link.site}/${link.collection}] "${link.sourceTitle}" (${link.sourceUrl}) ` +
-        `→ missing doc ${link.targetUuid}${label}`,
+      `\nFound ${urls.length} dead helpcenter URL(s) — page renamed, moved or deleted. ` +
+        `Prefer replacing them with a Docs interlink, which survives renames:\n`,
     );
+    for (const link of urls) console.log(formatLink(link));
   }
   process.exitCode = 1;
 }
